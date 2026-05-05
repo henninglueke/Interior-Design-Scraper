@@ -1,33 +1,27 @@
 #!/usr/bin/env python3
 """Scrape BDIA member names and email addresses.
 
-Walks the paginated member listing at bdia.de/mitglieder/, collects each
-member profile URL, then visits every profile and extracts the name (page
-heading) plus the email address from the `mailto:` link behind the envelope
-icon. Results are written to a CSV.
+Reads every member profile URL from the WordPress sitemap
+(`wp-sitemap-posts-person-1.xml`), then visits each profile and extracts
+the name (from the page <title>) plus the email address from the first
+member-specific `mailto:` link. Site-wide footer addresses (e.g.
+info@bdia.de) are filtered out. Results are written to a CSV.
 
 Usage:
     python scraper.py [output.csv]
 """
 
 import csv
+import html as html_lib
+import re
 import sys
 import time
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
 
-LIST_URL = (
-    "https://bdia.de/mitglieder/"
-    "?wpv_view_count=108796"
-    "&wpv_post_search="
-    "&wpv-dienstleistung=0"
-    "&wpv-objektart=0"
-    "&wpv-wpcf-adresse="
-    "&wpv-wpcf-bdia-landesverband="
-    "&wpv_filter_submit=Suchen"
-)
+SITEMAP_URL = "https://bdia.de/wp-sitemap-posts-person-1.xml"
 
 HEADERS = {
     "User-Agent": (
@@ -40,13 +34,8 @@ HEADERS = {
 REQUEST_DELAY = 1.0
 REQUEST_TIMEOUT = 30
 
-
-def with_page(url: str, page: int) -> str:
-    parts = urlparse(url)
-    qs = parse_qs(parts.query, keep_blank_values=True)
-    qs["wpv_paged"] = [str(page)]
-    new_query = urlencode([(k, v) for k, vs in qs.items() for v in vs])
-    return urlunparse(parts._replace(query=new_query))
+# Site-wide addresses to ignore — these appear in the footer of every page.
+EMAIL_BLOCKLIST = {"info@bdia.de"}
 
 
 def fetch(session: requests.Session, url: str) -> str:
@@ -55,72 +44,43 @@ def fetch(session: requests.Session, url: str) -> str:
     return resp.text
 
 
-def extract_profile_links(html: str, base_url: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links: set[str] = set()
-    for a in soup.select('a[href*="/mitglieder/"]'):
-        href = a.get("href")
-        if not href:
-            continue
-        absolute = urljoin(base_url, href)
-        parsed = urlparse(absolute)
-        if parsed.netloc and "bdia.de" not in parsed.netloc:
-            continue
-        path_parts = [p for p in parsed.path.split("/") if p]
-        # individual profiles look like /mitglieder/<slug>/, not the listing root
-        if len(path_parts) >= 2 and path_parts[0] == "mitglieder":
-            clean = urlunparse(parsed._replace(query="", fragment=""))
-            links.add(clean)
-    return sorted(links)
-
-
-def has_next_page(html: str, current_page: int) -> bool:
-    if f"wpv_paged={current_page + 1}" in html:
-        return True
-    soup = BeautifulSoup(html, "html.parser")
-    return bool(soup.select_one('a[rel="next"]'))
-
-
-def parse_profile(html: str) -> tuple[str, str] | None:
-    soup = BeautifulSoup(html, "html.parser")
-    mailto = soup.select_one('a[href^="mailto:"]')
-    if not mailto:
-        return None
-    email = mailto["href"][len("mailto:"):].split("?")[0].strip()
-    if not email:
-        return None
-    name = ""
-    h1 = soup.find("h1")
-    if h1:
-        name = h1.get_text(" ", strip=True)
-    if not name and soup.title:
-        name = soup.title.get_text(strip=True)
-    return name, email
-
-
 def collect_profile_urls(session: requests.Session) -> list[str]:
-    profile_urls: set[str] = set()
-    page = 1
-    while True:
-        url = LIST_URL if page == 1 else with_page(LIST_URL, page)
-        print(f"[list] page {page}", file=sys.stderr)
-        html = fetch(session, url)
-        new_links = extract_profile_links(html, url)
-        before = len(profile_urls)
-        profile_urls.update(new_links)
-        added = len(profile_urls) - before
-        print(f"  {len(new_links)} links on page, {added} new", file=sys.stderr)
-        if added == 0 or not has_next_page(html, page):
-            break
-        page += 1
-        time.sleep(REQUEST_DELAY)
-    return sorted(profile_urls)
+    print(f"[sitemap] {SITEMAP_URL}", file=sys.stderr)
+    xml = fetch(session, SITEMAP_URL)
+    root = ET.fromstring(xml)
+    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+    urls = [loc.text.strip() for loc in root.findall(".//sm:url/sm:loc", ns) if loc.text]
+    return sorted(set(urls))
+
+
+def extract_name(soup: BeautifulSoup) -> str:
+    if soup.title and soup.title.string:
+        title = html_lib.unescape(soup.title.string).strip()
+        # Title format: "Bianca Baab – bdia bund deutscher ..."
+        # Split on en-dash, em-dash, or hyphen surrounded by spaces.
+        parts = re.split(r"\s[–—-]\s", title, maxsplit=1)
+        return parts[0].strip()
+    return ""
+
+
+def extract_email(soup: BeautifulSoup) -> str:
+    for a in soup.select('a[href^="mailto:"]'):
+        href = a.get("href", "")
+        email = href[len("mailto:"):].split("?")[0].strip().lower()
+        if email and email not in EMAIL_BLOCKLIST:
+            return email
+    return ""
+
+
+def parse_profile(html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(html, "html.parser")
+    return extract_name(soup), extract_email(soup)
 
 
 def main(out_path: str) -> None:
     session = requests.Session()
     profile_urls = collect_profile_urls(session)
-    print(f"[total] {len(profile_urls)} unique profiles", file=sys.stderr)
+    print(f"[total] {len(profile_urls)} profiles in sitemap", file=sys.stderr)
 
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -129,16 +89,13 @@ def main(out_path: str) -> None:
             try:
                 html = fetch(session, profile_url)
             except requests.RequestException as e:
-                print(f"  [{i}] FAILED {profile_url}: {e}", file=sys.stderr)
+                print(f"  [{i}/{len(profile_urls)}] FAILED {profile_url}: {e}", file=sys.stderr)
                 continue
-            result = parse_profile(html)
-            if result is None:
-                print(f"  [{i}] no email on {profile_url}", file=sys.stderr)
-                continue
-            name, email = result
+            name, email = parse_profile(html)
             writer.writerow([name, email, profile_url])
             f.flush()
-            print(f"  [{i}/{len(profile_urls)}] {name} <{email}>", file=sys.stderr)
+            status = f"{name} <{email}>" if email else f"{name} <NO EMAIL>"
+            print(f"  [{i}/{len(profile_urls)}] {status}", file=sys.stderr)
             time.sleep(REQUEST_DELAY)
 
 
